@@ -1,14 +1,17 @@
-# app/client.py
+# app/client.py  (Phase-4 ready)
 import socket
 import os
 import base64
 import json
+import time
 from app.common import protocol as proto
 from app.crypto import pki, dh as dhmod, aes as aesmod
+from app.crypto import sign as signmod
 
 CERTS_DIR = "certs"
 CA_CERT_PATH = os.path.join(CERTS_DIR, "ca.cert.pem")
 CLIENT_CERT_PATH = os.path.join(CERTS_DIR, "client.local.cert.pem")
+CLIENT_KEY_PATH = os.path.join(CERTS_DIR, "client.local.key.pem")
 
 HOST = "127.0.0.1"
 PORT = 9000
@@ -40,12 +43,25 @@ def do_handshake(f, ca_cert, client_pem):
     K = dhmod.ks_to_aes128_key(Ks)
     # read handshake_complete
     f.readline()
-    return K
+    return K, server_cert
 
-def send_encrypted_and_receive(f, K: bytes, payload: dict, seqno: int):
+def sign_message(priv_key, seqno: int, ts: int, ct_b64: str) -> str:
+    hash_input = f"{seqno}|{ts}|{ct_b64}".encode()
+    return signmod.rsa_sign(priv_key, hash_input)
+
+def send_encrypted_and_receive(f, K: bytes, payload: dict, seqno: int, client_priv=None):
+    """
+    Encrypt payload to ct_b64, sign seqno|ts|ct_b64 with client_priv (if provided),
+    send outer envelope {type:enc, seqno, ct, ts, sig}
+    """
     pt = json.dumps(payload, separators=(",", ":")).encode()
     ct = aesmod.encrypt_ecb_pkcs7(K, pt)
-    outer = {"type":"enc", "seqno": seqno, "ct": aesmod.b64enc(ct)}
+    ct_b64 = aesmod.b64enc(ct)
+    ts = int(time.time() * 1000)
+    sig_b64 = None
+    if client_priv is not None:
+        sig_b64 = sign_message(client_priv, seqno, ts, ct_b64)
+    outer = {"type":"enc", "seqno": seqno, "ct": ct_b64, "ts": ts, "sig": sig_b64}
     f.write(proto.pack_message(outer)); f.flush()
     line = f.readline()
     if not line:
@@ -57,12 +73,22 @@ def main():
     with open(CLIENT_CERT_PATH, "rb") as f:
         client_pem = f.read().decode()
 
+    # load client private key for signing messages
+    try:
+        client_priv = signmod.load_private_key(CLIENT_KEY_PATH)
+    except Exception as e:
+        print("[-] failed to load client private key:", e)
+        client_priv = None
+
     s = socket.create_connection((HOST, PORT))
     f = s.makefile("rwb")
     try:
-        K = do_handshake(f, ca_cert, client_pem)
+        (K, server_cert) = do_handshake(f, ca_cert, client_pem)
         print("[*] session key derived (hex):", K.hex())
         seqno = 1
+        logged_in = False
+        username = None
+
         while True:
             print("\nChoose: 1) register  2) login  3) quit")
             c = input("Choice> ").strip()
@@ -71,17 +97,78 @@ def main():
                 username = input("username> ").strip()
                 password = input("password> ").strip()
                 payload = {"type":"register","email":email,"username":username,"password":password}
-                resp = send_encrypted_and_receive(f, K, payload, seqno); seqno += 1
+                resp = send_encrypted_and_receive(f, K, payload, seqno, client_priv); seqno += 1
                 print("server ->", resp)
+
             elif c == "2":
                 email = input("email> ").strip()
                 password = input("password> ").strip()
                 payload = {"type":"login","email":email,"password":password}
-                resp = send_encrypted_and_receive(f, K, payload, seqno); seqno += 1
+                resp = send_encrypted_and_receive(f, K, payload, seqno, client_priv); seqno += 1
                 print("server ->", resp)
                 if resp and resp.get("ok"):
                     print("[+] logged in as", resp.get("username"))
+                    logged_in = True
+                    username = resp.get("username")
+
+                    # chat loop
+                    while logged_in:
+                        print("\nChat: 1) send message  2) end session (get receipt)  3) logout")
+                        ch = input("Chat> ").strip()
+                        if ch == "1":
+                            text = input("Message> ").strip()
+                            payload = {"type":"msg","text": text}
+                            resp = send_encrypted_and_receive(f, K, payload, seqno, client_priv); seqno += 1
+                            print("server ->", resp)
+
+                        elif ch == "2":
+                            payload = {"type":"end_session"}
+                            resp = send_encrypted_and_receive(f, K, payload, seqno, client_priv); seqno += 1
+                            print("server ->", resp)
+                            # server sends plaintext receipt JSON (not encrypted)
+                            if resp and resp.get("type") == "receipt":
+                                server_receipt = resp
+                                hex_hash = server_receipt.get("transcript_sha256")
+                                sig = server_receipt.get("sig")
+                                if sig:
+                                    try:
+                                        server_pub = server_cert.public_key()
+                                        ok = signmod.rsa_verify(server_pub, bytes.fromhex(hex_hash), sig)
+                                        print("[*] server receipt signature valid:", ok)
+                                    except Exception as e:
+                                        print("[-] failed to verify server signature:", e)
+                                else:
+                                    print("[-] server did not provide signature")
+
+                                # create client receipt and save locally
+                                if client_priv:
+                                    client_sig = signmod.rsa_sign(client_priv, bytes.fromhex(hex_hash))
+                                else:
+                                    client_sig = None
+                                client_receipt = {
+                                    "type": "receipt",
+                                    "peer": "client",
+                                    "first_seq": server_receipt.get("first_seq", 0),
+                                    "last_seq": server_receipt.get("last_seq"),
+                                    "transcript_sha256": hex_hash,
+                                    "sig": client_sig
+                                }
+                                os.makedirs("transcripts", exist_ok=True)
+                                path = os.path.join("transcripts", f"receipt_client_{int(time.time()*1000)}.json")
+                                with open(path, "w", encoding="utf-8") as rf:
+                                    json.dump(client_receipt, rf, separators=(",",":"))
+                                print("[*] saved client receipt to", path)
+                            else:
+                                print("[-] unexpected server response for end_session:", resp)
+
+                        elif ch == "3":
+                            logged_in = False
+                            print("[*] logged out")
+                        else:
+                            print("invalid chat option")
+
             elif c == "3":
+                print("quitting")
                 break
             else:
                 print("invalid choice")
