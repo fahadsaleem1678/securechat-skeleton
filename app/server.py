@@ -1,4 +1,4 @@
-# app/server.py  (Phase-4 ready)  -- patched: enforces client cert hostname check
+# app/server.py  (Phase-4 ready)  
 import socket
 import threading
 import os
