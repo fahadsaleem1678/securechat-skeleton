@@ -1,4 +1,4 @@
-# app/client.py  (Phase-4 ready)
+# app/client.py  (Phase-4 ready) -- replay option added (no other logic changed)
 import socket
 import os
 import base64
@@ -113,7 +113,8 @@ def main():
 
                     # chat loop
                     while logged_in:
-                        print("\nChat: 1) send message  2) end session (get receipt)  3) logout")
+                        # <-- replay option added here only (no other logic changed)
+                        print("\nChat: 1) send message  2) end session (get receipt)  3) logout  4) replay last seqno")
                         ch = input("Chat> ").strip()
                         if ch == "1":
                             text = input("Message> ").strip()
@@ -164,6 +165,20 @@ def main():
                         elif ch == "3":
                             logged_in = False
                             print("[*] logged out")
+
+                        # Replay option: resend previous seqno (do NOT increment seqno)
+                        elif ch == "4":
+                            # only attempt a replay if there is a previous seq to reuse
+                            if seqno <= 1:
+                                print("[-] no previous seqno to replay")
+                            else:
+                                old_seq = seqno - 1
+                                print(f"[*] sending replay with seqno={old_seq} (expect server to respond with REPLAY)")
+                                # send a small test payload (message) with old_seq; do NOT increment seqno
+                                payload = {"type":"msg","text":"REPLAY_TEST"}
+                                resp = send_encrypted_and_receive(f, K, payload, old_seq, client_priv)
+                                print("server ->", resp)
+
                         else:
                             print("invalid chat option")
 
