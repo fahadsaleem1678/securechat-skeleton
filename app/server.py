@@ -1,4 +1,4 @@
-# app/server.py  (Phase-4 ready)
+# app/server.py  (Phase-4 ready)  -- patched: enforces client cert hostname check
 import socket
 import threading
 import os
@@ -52,7 +52,8 @@ def handle_client(conn, addr, ca_cert):
 
         try:
             client_cert = pki.load_cert_pem_bytes(client_pem.encode())
-            pki.verify_certificate_chain(client_cert, ca_cert, expected_hostname=None)
+            # ---- ENFORCE: validate client cert using CA and hostname "client.local" ----
+            pki.verify_certificate_chain(client_cert, ca_cert, expected_hostname="client.local")
         except Exception as e:
             f.write(proto.pack_message({"type": "bad_cert", "reason": str(e)}))
             f.flush()
